@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+uploaded_documents/
+land_records.db
