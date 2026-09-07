@@ -49,8 +49,13 @@ except Exception:
     GEMINI_API_KEY = ""
 GEMINI_API_KEY = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY", "")
 
-# This model is supported by the current Google GenAI SDK.
+# Primary model + ordered fallback list for 503 overload resilience.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_FALLBACK_MODELS = [
+    GEMINI_MODEL,
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+]
 
 MAX_UPLOAD_MB = 10
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
@@ -717,6 +722,21 @@ def delete_saved_files(paths: list[str]) -> None:
 # 7. AI EXTRACTION
 # =========================================================
 
+def _is_overload_error(exc: Exception) -> bool:
+    """Return True when the exception looks like a 503 / high-demand error."""
+    msg = str(exc).upper()
+    return any(
+        token in msg
+        for token in ("503", "UNAVAILABLE", "HIGH DEMAND", "OVERLOADED", "RETRY LATER")
+    )
+
+
+def _is_not_found_error(exc: Exception) -> bool:
+    """Return True when the model name is not available (404 / NOT_FOUND)."""
+    msg = str(exc).upper()
+    return any(token in msg for token in ("404", "NOT_FOUND", "NO LONGER AVAILABLE"))
+
+
 def extract_land_record_data(uploaded_files) -> LandRecordExtraction:
     if genai is None or types is None:
         raise RuntimeError(
@@ -759,30 +779,61 @@ def extract_land_record_data(uploaded_files) -> LandRecordExtraction:
 
     client = genai.Client(api_key=GEMINI_API_KEY)
 
-    # Current Google GenAI SDK supports Pydantic response_schema for
-    # generate_content. This is intentionally kept compatible with the
-    # existing app architecture.
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[prompt, *images],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=LandRecordExtraction,
-            temperature=0.1,
-        ),
+    # Try each model in order. For 503 overload errors, retry up to 3 times
+    # with exponential back-off before moving to the next model.
+    # For 404 not-found errors, skip immediately to the next model.
+    last_exc: Optional[Exception] = None
+
+    for model_name in GEMINI_FALLBACK_MODELS:
+        retries = 3
+        for attempt in range(retries):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt, *images],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=LandRecordExtraction,
+                        temperature=0.1,
+                    ),
+                )
+
+                if getattr(response, "parsed", None) is not None:
+                    parsed = response.parsed
+                    if isinstance(parsed, LandRecordExtraction):
+                        return parsed
+                    return LandRecordExtraction.model_validate(parsed)
+
+                response_text = getattr(response, "text", None)
+                if not response_text:
+                    raise RuntimeError("Gemini returned an empty response.")
+
+                return LandRecordExtraction.model_validate_json(response_text)
+
+            except Exception as exc:
+                last_exc = exc
+
+                if _is_not_found_error(exc):
+                    # Model is unavailable — skip remaining retries, try next model.
+                    break
+
+                if _is_overload_error(exc):
+                    if attempt < retries - 1:
+                        wait = 2 ** attempt  # 1 s, 2 s, 4 s
+                        import time
+                        time.sleep(wait)
+                        continue
+                    # Exhausted retries for this model, try next model.
+                    break
+
+                # Any other error (auth, schema, network) — re-raise immediately.
+                raise
+
+    # All models and retries exhausted.
+    raise RuntimeError(
+        f"AI extraction failed after trying all available models. "
+        f"Last error: {last_exc}"
     )
-
-    if getattr(response, "parsed", None) is not None:
-        parsed = response.parsed
-        if isinstance(parsed, LandRecordExtraction):
-            return parsed
-        return LandRecordExtraction.model_validate(parsed)
-
-    response_text = getattr(response, "text", None)
-    if not response_text:
-        raise RuntimeError("Gemini returned an empty response.")
-
-    return LandRecordExtraction.model_validate_json(response_text)
 
 
 def sanitize_extracted_data(data: LandRecordExtraction) -> LandRecordExtraction:
