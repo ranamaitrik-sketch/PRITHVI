@@ -50,7 +50,7 @@ except Exception:
 GEMINI_API_KEY = GEMINI_API_KEY or os.getenv("GEMINI_API_KEY", "")
 
 # This model is supported by the current Google GenAI SDK.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 MAX_UPLOAD_MB = 10
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
